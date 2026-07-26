@@ -126,31 +126,77 @@ def _parse_meminfo() -> dict[str, Any]:
 
 
 def _get_storage_info() -> dict[str, Any]:
-    """Get storage/filesystem statistics from statvfs."""
+    """Get storage/filesystem statistics from statvfs.
+    
+    Returns storage information grouped by underlying filesystem device.
+    Multiple mountpoints on the same filesystem are reported together
+    to avoid presenting them as independent storage devices.
+    """
     result: dict[str, Any] = {
-        "mounts": [],
+        "filesystems": [],
     }
     
     mountpoints = ["/", "/home", "/tmp", "/var"]
     
+    # Track seen filesystem devices by (device_id) to group mounts
+    # We use os.statvfs().f_fsid as a filesystem identifier
+    # Note: This is NOT a persistent identifier across reboots
+    seen_filesystems: dict[int, dict[str, Any]] = {}
+    mount_to_fs: dict[str, int] = {}  # Maps mountpoint to filesystem index
+    
     for mountpoint in mountpoints:
         try:
             stat = os.statvfs(mountpoint)
+            fs_id = stat.f_fsid  # Filesystem ID (not persistent across reboots)
+            
             total_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
             free_gb = (stat.f_bfree * stat.f_frsize) / (1024**3)
             available_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
             used_gb = total_gb - free_gb
             
-            result["mounts"].append({
+            mount_info = {
                 "path": mountpoint,
                 "total_gb": round(total_gb, 2),
                 "used_gb": round(used_gb, 2),
                 "free_gb": round(free_gb, 2),
                 "available_gb": round(available_gb, 2),
                 "percent_used": round((1 - stat.f_bavail / stat.f_blocks) * 100, 1) if stat.f_blocks else None,
-            })
+            }
+            
+            if fs_id in seen_filesystems:
+                # This mountpoint is on an already-seen filesystem
+                # Add it as an additional mount point for this filesystem
+                seen_filesystems[fs_id]["mount_points"].append(mountpoint)
+            else:
+                # New filesystem - create entry
+                fs_index = len(seen_filesystems)
+                seen_filesystems[fs_id] = {
+                    "filesystem_index": fs_index,
+                    "primary_mount": mountpoint,
+                    "mount_points": [mountpoint],
+                    "total_gb": round(total_gb, 2),
+                    "used_gb": round(used_gb, 2),
+                    "free_gb": round(free_gb, 2),
+                    "available_gb": round(available_gb, 2),
+                    "percent_used": round((1 - stat.f_bavail / stat.f_blocks) * 100, 1) if stat.f_blocks else None,
+                }
+                mount_to_fs[mountpoint] = fs_index
+                
         except (OSError, PermissionError):
             continue
+    
+    # Convert to list output format
+    for fs_id, fs_data in seen_filesystems.items():
+        result["filesystems"].append({
+            "filesystem_index": fs_data["filesystem_index"],
+            "primary_mount": fs_data["primary_mount"],
+            "mount_points": sorted(fs_data["mount_points"]),
+            "total_gb": fs_data["total_gb"],
+            "used_gb": fs_data["used_gb"],
+            "free_gb": fs_data["free_gb"],
+            "available_gb": fs_data["available_gb"],
+            "percent_used": fs_data["percent_used"],
+        })
     
     return result
 
@@ -292,7 +338,7 @@ def collect() -> dict[str, Any]:
             "release": platform.release(),
             "version": platform.version(),
             "machine": platform.machine(),
-            "node": platform.node(),
+            # node (hostname) intentionally excluded for privacy
         }
         
         # Try to get Linux distribution info
@@ -325,7 +371,7 @@ def collect() -> dict[str, Any]:
         uname = os.uname()
         result["kernel"] = {
             "sysname": uname.sysname,
-            "nodename": uname.nodename,
+            # nodename (hostname) intentionally excluded for privacy
             "release": uname.release,
             "version": uname.version,
             "machine": uname.machine,

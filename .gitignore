@@ -1,44 +1,23 @@
 ```
-# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-env/
-venv/
-.venv/
-.ENV
-.python-version
-.pytest_cache/
-.mypy_cache/
-.coverage
-htmlcov/
-
-# Build artifacts
 build/
 dist/
 *.egg-info/
-.sconsign.dblite
-._build/
-cover/
-
-# Logs
-*.log
-
-# Environment variables
+.coverage
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.venv/
+venv/
 .env
-.env.local
 *.env.*
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*.tmp
-
-# OS
 .DS_Store
 Thumbs.db
+*.log
+*.tmp
+.vscode/
+.idea/
 ```

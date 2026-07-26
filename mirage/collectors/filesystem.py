@@ -73,8 +73,22 @@ def _categorize_extension(ext: str) -> Optional[str]:
         return "other"
 
 
-def _get_age_distribution(mtimes: list[float]) -> dict[str, Any]:
-    """Calculate age distribution from modification times."""
+def _get_age_distribution(mtimes: list[float], reference_time: float) -> dict[str, Any]:
+    """Calculate age distribution from modification times using mutually exclusive bins.
+    
+    Args:
+        mtimes: List of modification timestamps
+        reference_time: Single reference timestamp for the collector run
+        
+    Returns:
+        Dictionary with count and mutually exclusive age bins.
+        
+    Notes:
+        - Age bins are MUTUALLY EXCLUSIVE - each file belongs to exactly one bin
+        - Bins: 0_to_1_day, 1_to_7_days, 7_to_30_days, 30_to_365_days, over_365_days, future_timestamp
+        - Sum of all bins equals count
+        - Future timestamps (mtime > reference_time) are counted separately
+    """
     if not mtimes:
         return {
             "count": 0,
@@ -83,56 +97,80 @@ def _get_age_distribution(mtimes: list[float]) -> dict[str, Any]:
             "median_age_days": None,
             "mean_age_days": None,
             "by_period": {
-                "last_day": 0,
-                "last_week": 0,
-                "last_month": 0,
-                "last_year": 0,
-                "older": 0,
+                "0_to_1_day": 0,
+                "1_to_7_days": 0,
+                "7_to_30_days": 0,
+                "30_to_365_days": 0,
+                "over_365_days": 0,
+                "future_timestamp": 0,
             },
         }
     
-    now = time.time()
-    ages_days = [(now - mt) / 86400 for mt in mtimes]  # Convert seconds to days
+    # Calculate ages in days relative to reference time
+    ages_days = [(reference_time - mt) / 86400 for mt in mtimes]  # Convert seconds to days
     
     ages_sorted = sorted(ages_days)
     count = len(ages_sorted)
     
-    # Calculate periods
-    last_day = sum(1 for age in ages_days if age <= 1)
-    last_week = sum(1 for age in ages_days if age <= 7)
-    last_month = sum(1 for age in ages_days if age <= 30)
-    last_year = sum(1 for age in ages_days if age <= 365)
-    older = count - last_year
+    # Mutually exclusive bins
+    # Files with negative age (mtime in future) go to future_timestamp
+    future_timestamp = sum(1 for age in ages_days if age < 0)
+    # 0 to 1 day (age >= 0 and age < 1)
+    bin_0_to_1_day = sum(1 for age in ages_days if 0 <= age < 1)
+    # 1 to 7 days (age >= 1 and age < 7)
+    bin_1_to_7_days = sum(1 for age in ages_days if 1 <= age < 7)
+    # 7 to 30 days (age >= 7 and age < 30)
+    bin_7_to_30_days = sum(1 for age in ages_days if 7 <= age < 30)
+    # 30 to 365 days (age >= 30 and age < 365)
+    bin_30_to_365_days = sum(1 for age in ages_days if 30 <= age < 365)
+    # Over 365 days (age >= 365)
+    bin_over_365_days = sum(1 for age in ages_days if age >= 365)
     
-    # Median
-    mid = count // 2
-    if count % 2 == 0:
-        median = (ages_sorted[mid - 1] + ages_sorted[mid]) / 2
+    # Median calculation (only for non-future timestamps)
+    non_future_ages = [age for age in ages_sorted if age >= 0]
+    if non_future_ages:
+        mid = len(non_future_ages) // 2
+        if len(non_future_ages) % 2 == 0:
+            median = (non_future_ages[mid - 1] + non_future_ages[mid]) / 2
+        else:
+            median = non_future_ages[mid]
     else:
-        median = ages_sorted[mid]
+        median = None
+    
+    # Mean calculation (only for non-future timestamps)
+    mean_age = sum(a for a in ages_days if a >= 0) / len(non_future_ages) if non_future_ages else None
+    
+    # Min/max age (only considering non-future timestamps)
+    min_age = min(non_future_ages) if non_future_ages else None
+    max_age = max(non_future_ages) if non_future_ages else None
     
     return {
         "count": count,
-        "min_age_days": round(min(ages_days), 2),
-        "max_age_days": round(max(ages_days), 2),
-        "median_age_days": round(median, 2),
-        "mean_age_days": round(sum(ages_days) / count, 2),
+        "min_age_days": round(min_age, 2) if min_age is not None else None,
+        "max_age_days": round(max_age, 2) if max_age is not None else None,
+        "median_age_days": round(median, 2) if median is not None else None,
+        "mean_age_days": round(mean_age, 2) if mean_age is not None else None,
         "by_period": {
-            "last_day": last_day,
-            "last_week": last_week,
-            "last_month": last_month,
-            "last_year": last_year,
-            "older": older,
+            "0_to_1_day": bin_0_to_1_day,
+            "1_to_7_days": bin_1_to_7_days,
+            "7_to_30_days": bin_7_to_30_days,
+            "30_to_365_days": bin_30_to_365_days,
+            "over_365_days": bin_over_365_days,
+            "future_timestamp": future_timestamp,
         },
     }
 
 
-def _scan_path(path_str: str) -> dict[str, Any]:
+def _scan_path(path_str: str, reference_time: float) -> dict[str, Any]:
     """Scan a single path for filesystem statistics.
     
     Bounded traversal with explicit limits and error reporting.
     Never follows symlinks. Avoids pseudo-filesystems.
     Reports truncation if limits are reached.
+    
+    Args:
+        path_str: Path to scan
+        reference_time: Single reference timestamp for age calculations
     """
     result: dict[str, Any] = {
         "path": path_str,
@@ -261,8 +299,8 @@ def _scan_path(path_str: str) -> dict[str, Any]:
     result["entries_examined"] = entries_examined
     result["permission_denied_count"] = permission_denied_count
     
-    # Calculate age distribution before returning
-    age_dist = _get_age_distribution(result["mtimes"])
+    # Calculate age distribution before returning using reference time
+    age_dist = _get_age_distribution(result["mtimes"], reference_time)
     result["age_distribution"] = age_dist
     
     # Remove raw mtimes from output (privacy)
@@ -282,12 +320,17 @@ def collect() -> dict[str, Any]:
         - Reports truncation and permission errors
         - Does not follow symlinks
         - Avoids pseudo-filesystems
+        - Uses a single reference timestamp for all age calculations
     """
     result: dict[str, Any] = {
         "scanned_paths": [],
         "aggregate_statistics": {},
         "errors": [],
     }
+    
+    # Capture a single reference timestamp for this collector run
+    # This ensures consistent age calculations across all files
+    reference_time = time.time()
     
     all_file_counts = []
     all_dir_counts = []
@@ -310,7 +353,7 @@ def collect() -> dict[str, Any]:
     
     for scan_path in SCAN_PATHS:
         try:
-            path_result = _scan_path(scan_path)
+            path_result = _scan_path(scan_path, reference_time)
             result["scanned_paths"].append(path_result)
             
             if path_result["exists"] and path_result["is_readable"]:
@@ -371,7 +414,7 @@ def collect() -> dict[str, Any]:
         "total_size_bytes": all_size_bytes,
         "type_counts": combined_type_counts,
         "top_extensions": dict(sorted(combined_extension_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
-        "age_distribution": _get_age_distribution(all_mtimes),
+        "age_distribution": _get_age_distribution(all_mtimes, reference_time),
         "collection_complete": not any_truncated,
         "total_entries_examined": total_entries_examined,
         "total_permission_denied": total_permission_denied,

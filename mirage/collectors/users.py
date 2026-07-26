@@ -126,6 +126,12 @@ def collect() -> dict[str, Any]:
           from /etc/login.defs when available.
         - If UID range is not configured, classification is marked as unavailable
           rather than assuming a distribution-specific threshold.
+        - Home directory traversal:
+          * Never follows symlinks
+          * Uses lstat() for size (apparent size, not allocated blocks)
+          * Counts only regular files for size calculations
+          * Excludes special files (devices, sockets, FIFOs) from size
+          * Reports entries_examined, permission errors, and truncation state
     """
     result: dict[str, Any] = {
         "account_statistics": {},
@@ -220,26 +226,94 @@ def collect() -> dict[str, Any]:
         total_size_bytes = 0
         oldest_mtime = None
         newest_mtime = None
+        permission_denied_count = 0
+        entries_examined = 0
+        symlink_count = 0
+        special_file_count = 0
+        traversed_home_count = 0
+        
+        # Maximum entries to examine per home directory to prevent runaway traversal
+        MAX_ENTRIES_PER_HOME = 10000
+        # Maximum depth to traverse
+        MAX_DEPTH = 5
         
         for home_path in home_dirs:
             path = Path(home_path)
             if path.exists() and path.is_dir():
                 existing_homes.append(home_path)
+                traversed_home_count += 1
                 
-                # Count files and directories (with reasonable limits)
+                # Count files and directories with bounded traversal
+                # NEVER follows symlinks, uses lstat
                 try:
                     file_count = 0
                     dir_count = 0
                     dir_size = 0
+                    home_entries = 0
+                    truncated = False
                     
-                    for root, dirs, files in os.walk(path):
+                    for root, dirs, files in os.walk(path, followlinks=False, topdown=True):
+                        # Check depth limit
+                        try:
+                            current_depth = len(Path(root).parts) - len(path.parts)
+                        except (ValueError, TypeError):
+                            current_depth = 0
+                        
+                        if current_depth > MAX_DEPTH:
+                            dirs.clear()
+                            continue
+                        
+                        # Filter out symlinked directories to prevent following them
+                        dirs_to_remove = []
+                        for d in dirs:
+                            dir_path = Path(root) / d
+                            if dir_path.is_symlink():
+                                dirs_to_remove.append(d)
+                                symlink_count += 1
+                        for d in dirs_to_remove:
+                            dirs.remove(d)
+                        
                         dir_count += len(dirs)
-                        file_count += len(files)
                         
                         for f in files:
+                            if home_entries >= MAX_ENTRIES_PER_HOME:
+                                truncated = True
+                                dirs.clear()
+                                break
+                            
+                            home_entries += 1
+                            entries_examined += 1
+                            
                             try:
                                 fp = Path(root) / f
-                                stat_info = fp.stat()
+                                # Use lstat to NOT follow symlinks
+                                stat_info = fp.lstat()
+                                
+                                # Check if this is a symlink
+                                if fp.is_symlink():
+                                    symlink_count += 1
+                                    continue  # Don't count symlink targets
+                                
+                                # Check for special files (not regular files)
+                                import stat
+                                mode = stat_info.st_mode
+                                if not stat.S_ISREG(mode):
+                                    # This is a special file (device, socket, FIFO, etc.)
+                                    special_file_count += 1
+                                    # Still count it as a file but don't add its size
+                                    file_count += 1
+                                    
+                                    # Track mtime even for special files
+                                    mtime = stat_info.st_mtime
+                                    if oldest_mtime is None or mtime < oldest_mtime:
+                                        oldest_mtime = mtime
+                                    if newest_mtime is None or mtime > newest_mtime:
+                                        newest_mtime = mtime
+                                    continue
+                                
+                                # Regular file - count size
+                                file_count += 1
+                                # Use st_size (apparent size), not st_blocks * 512 (allocated)
                                 dir_size += stat_info.st_size
                                 mtime = stat_info.st_mtime
                                 
@@ -247,23 +321,34 @@ def collect() -> dict[str, Any]:
                                     oldest_mtime = mtime
                                 if newest_mtime is None or mtime > newest_mtime:
                                     newest_mtime = mtime
-                            except (OSError, PermissionError):
+                            except PermissionError:
+                                permission_denied_count += 1
+                                continue
+                            except (OSError, FileNotFoundError):
                                 continue
                         
-                        # Limit depth to avoid long scans
-                        if len(root.split(os.sep)) - len(path.parts) > 3:
-                            dirs.clear()
+                        if truncated:
+                            break
                     
                     total_files += file_count
                     total_dirs += dir_count
                     total_size_bytes += dir_size
                     
-                except (OSError, PermissionError):
+                    # Record truncation info if any home was truncated
+                    if truncated:
+                        if "truncation_info" not in result:
+                            result["truncation_info"] = {}
+                        result["truncation_info"]["home_truncated"] = True
+                        result["truncation_info"]["reason"] = f"max_entries_per_home ({MAX_ENTRIES_PER_HOME}) reached"
+                    
+                except PermissionError:
+                    permission_denied_count += 1
+                except (OSError, FileNotFoundError):
                     pass
             else:
                 missing_homes += 1
         
-        result["home_directory_statistics"] = {
+        home_stats: dict[str, Any] = {
             "total_home_dirs": len(home_dirs),
             "existing_home_count": len(existing_homes),
             "missing_home_count": missing_homes,
@@ -272,7 +357,18 @@ def collect() -> dict[str, Any]:
             "aggregate_size_bytes": total_size_bytes,
             "oldest_file_mtime": oldest_mtime,
             "newest_file_mtime": newest_mtime,
+            "entries_examined": entries_examined,
+            "permission_denied_count": permission_denied_count,
+            "symlink_count": symlink_count,
+            "special_file_count": special_file_count,
+            "traversed_home_count": traversed_home_count,
         }
+        
+        # Add truncation info if present
+        if "truncation_info" in result:
+            home_stats["truncation_info"] = result.pop("truncation_info")
+        
+        result["home_directory_statistics"] = home_stats
         
     except Exception as e:
         result["errors"].append(f"account_statistics: {str(e)}")

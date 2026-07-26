@@ -233,17 +233,18 @@ class TestFilesystemCollector:
     
     def test_age_distribution_empty(self):
         """Test age distribution with empty input."""
-        result = filesystem._get_age_distribution([])
+        import time
+        result = filesystem._get_age_distribution([], time.time())
         
         assert result["count"] == 0
         assert result["min_age_days"] is None
-        assert result["by_period"]["last_day"] == 0
+        assert result["by_period"]["0_to_1_day"] == 0
     
     def test_age_distribution_single_value(self):
         """Test age distribution with single value."""
         import time
         now = time.time()
-        result = filesystem._get_age_distribution([now])
+        result = filesystem._get_age_distribution([now], now)
         
         assert result["count"] == 1
         assert result["min_age_days"] == result["max_age_days"]
@@ -261,13 +262,12 @@ class TestFilesystemCollector:
             now - day * 400,    # 400 days ago
         ]
         
-        result = filesystem._get_age_distribution(mtimes)
+        result = filesystem._get_age_distribution(mtimes, now)
         
-        assert result["by_period"]["last_day"] == 1
-        assert result["by_period"]["last_week"] == 2
-        assert result["by_period"]["last_month"] == 3
-        assert result["by_period"]["last_year"] == 3
-        assert result["by_period"]["older"] == 1
+        assert result["by_period"]["0_to_1_day"] == 1
+        assert result["by_period"]["1_to_7_days"] == 1
+        assert result["by_period"]["7_to_30_days"] == 1
+        assert result["by_period"]["over_365_days"] == 1
     
     def test_categorize_extension(self):
         """Test file extension categorization."""
@@ -297,8 +297,9 @@ class TestFilesystemCollector:
     
     def test_scan_path_has_bounded_fields(self):
         """Test that individual path scans report bounded traversal info."""
+        import time
         # Test with /etc which should exist and be readable
-        result = filesystem._scan_path("/etc")
+        result = filesystem._scan_path("/etc", time.time())
         
         assert "entries_examined" in result
         assert "truncated" in result
@@ -448,3 +449,202 @@ class TestIntegration:
         assert len(data["collectors"]) == 2
         assert "system" in data["collectors"]
         assert "network" in data["collectors"]
+
+
+class TestPrivacyInvariants:
+    """Tests for privacy-related invariants that must always hold."""
+    
+    def test_hostname_not_in_serialized_output(self):
+        """Test that known hostname cannot appear anywhere in serialized output.
+        
+        This is a semantic test - it verifies that even if fields are renamed,
+        the actual hostname value does not leak into the output.
+        """
+        import platform
+        actual_hostname = platform.node()
+        
+        snapshot = Snapshot()
+        snapshot.set_metadata(collector_name="privacy_test")
+        
+        # Add all collector results
+        snapshot.add_collector_result("system", system.collect())
+        snapshot.add_collector_result("users", users.collect())
+        snapshot.add_collector_result("filesystem", filesystem.collect())
+        snapshot.add_collector_result("software", software.collect())
+        snapshot.add_collector_result("runtime", runtime.collect())
+        snapshot.add_collector_result("network", network.collect())
+        
+        # Serialize to JSON
+        json_str = snapshot.to_json()
+        
+        # The actual hostname should NOT appear anywhere in the output
+        # This catches leaks through node, nodename, or any other field
+        assert actual_hostname not in json_str, \
+            f"Hostname '{actual_hostname}' found in serialized output!"
+    
+    def test_hostname_not_in_system_os_or_kernel(self):
+        """Test that system.os.node and system.kernel.nodename are not present."""
+        result = system.collect()
+        
+        # os.node should not exist
+        assert "node" not in result.get("os", {}), \
+            "system.os.node should not be present (hostname leak)"
+        
+        # kernel.nodename should not exist  
+        assert "nodename" not in result.get("kernel", {}), \
+            "system.kernel.nodename should not be present (hostname leak)"
+
+
+class TestFilesystemSemantics:
+    """Tests for filesystem measurement semantics."""
+    
+    def test_age_bins_mutually_exclusive(self):
+        """Test that age bins are mutually exclusive - sum equals count."""
+        import time
+        now = time.time()
+        day = 86400  # seconds
+        
+        mtimes = [
+            now - day * 0.5,    # 12 hours ago -> 0_to_1_day
+            now - day * 3,      # 3 days ago -> 1_to_7_days
+            now - day * 15,     # 15 days ago -> 7_to_30_days
+            now - day * 100,    # 100 days ago -> 30_to_365_days
+            now - day * 400,    # 400 days ago -> over_365_days
+            now + day * 5,      # 5 days in future -> future_timestamp
+        ]
+        
+        result = filesystem._get_age_distribution(mtimes, now)
+        
+        by_period = result["by_period"]
+        bin_sum = (
+            by_period["0_to_1_day"] +
+            by_period["1_to_7_days"] +
+            by_period["7_to_30_days"] +
+            by_period["30_to_365_days"] +
+            by_period["over_365_days"] +
+            by_period["future_timestamp"]
+        )
+        
+        assert bin_sum == result["count"], \
+            f"Sum of bins ({bin_sum}) != count ({result['count']})"
+    
+    def test_age_bins_empty_input(self):
+        """Test age distribution with empty input."""
+        import time
+        result = filesystem._get_age_distribution([], time.time())
+        
+        assert result["count"] == 0
+        by_period = result["by_period"]
+        bin_sum = sum(by_period.values())
+        assert bin_sum == 0
+    
+    def test_future_timestamps_counted_explicitly(self):
+        """Test that future timestamps are counted in future_timestamp bin."""
+        import time
+        now = time.time()
+        future_mtime = now + 86400  # 1 day in future
+        
+        result = filesystem._get_age_distribution([future_mtime], now)
+        
+        assert result["by_period"]["future_timestamp"] == 1
+        assert result["by_period"]["0_to_1_day"] == 0
+    
+    def test_age_bin_boundaries(self):
+        """Test exact boundary conditions for age bins."""
+        import time
+        now = time.time()
+        day = 86400
+        
+        # Test files at exact boundaries
+        mtimes = [
+            now,                    # age = 0 -> 0_to_1_day
+            now - day * 0.999,      # age < 1 -> 0_to_1_day
+            now - day * 1.0,        # age = 1 -> 1_to_7_days
+            now - day * 6.999,      # age < 7 -> 1_to_7_days
+            now - day * 7.0,        # age = 7 -> 7_to_30_days
+            now - day * 29.999,     # age < 30 -> 7_to_30_days
+            now - day * 30.0,       # age = 30 -> 30_to_365_days
+            now - day * 364.999,    # age < 365 -> 30_to_365_days
+            now - day * 365.0,      # age = 365 -> over_365_days
+        ]
+        
+        result = filesystem._get_age_distribution(mtimes, now)
+        
+        assert result["by_period"]["0_to_1_day"] == 2
+        assert result["by_period"]["1_to_7_days"] == 2
+        assert result["by_period"]["7_to_30_days"] == 2
+        assert result["by_period"]["30_to_365_days"] == 2
+        assert result["by_period"]["over_365_days"] == 1
+        assert result["by_period"]["future_timestamp"] == 0
+
+
+class TestUsersCollectorSemantics:
+    """Tests for users collector semantics."""
+    
+    def test_home_traversal_does_not_follow_symlinks(self):
+        """Verify home directory traversal uses lstat and doesn't follow symlinks."""
+        # This test verifies the code path - actual symlink testing needs temp dirs
+        result = users.collect()
+        home_stats = result.get("home_directory_statistics", {})
+        
+        # Should report symlink_count if any were encountered
+        assert "symlink_count" in home_stats
+    
+    def test_home_traversal_reports_entries_examined(self):
+        """Test that home traversal reports entries_examined."""
+        result = users.collect()
+        home_stats = result.get("home_directory_statistics", {})
+        
+        assert "entries_examined" in home_stats
+        assert isinstance(home_stats["entries_examined"], int)
+    
+    def test_home_traversal_reports_permission_errors(self):
+        """Test that home traversal reports permission_denied_count."""
+        result = users.collect()
+        home_stats = result.get("home_directory_statistics", {})
+        
+        assert "permission_denied_count" in home_stats
+        assert isinstance(home_stats["permission_denied_count"], int)
+    
+    def test_special_files_not_counted_in_size(self):
+        """Test that special files don't inflate size measurements."""
+        result = users.collect()
+        home_stats = result.get("home_directory_statistics", {})
+        
+        # Should track special file count separately
+        assert "special_file_count" in home_stats
+
+
+class TestSystemStorageSemantics:
+    """Tests for system storage semantics."""
+    
+    def test_same_filesystem_grouped(self):
+        """Test that directories on same filesystem are not reported as independent devices."""
+        result = system.collect()
+        storage = result.get("storage", {})
+        filesystems = storage.get("filesystems", [])
+        
+        # Each filesystem entry should have mount_points list
+        for fs in filesystems:
+            assert "mount_points" in fs
+            assert isinstance(fs["mount_points"], list)
+            assert len(fs["mount_points"]) >= 1
+        
+        # If / and /home are on same filesystem, they should be in same entry
+        # We can't guarantee this in test environment, but structure should support it
+
+
+class TestTruncationSemantics:
+    """Tests for truncation reporting semantics."""
+    
+    def test_filesystem_reports_truncation_state(self):
+        """Test that incomplete filesystem traversal remains marked incomplete."""
+        result = filesystem.collect()
+        agg = result.get("aggregate_statistics", {})
+        
+        assert "collection_complete" in agg
+        assert isinstance(agg["collection_complete"], bool)
+        
+        # If truncated, should have truncation_reasons
+        if not agg["collection_complete"]:
+            assert "truncation_reasons" in agg

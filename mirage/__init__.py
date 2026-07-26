@@ -11,7 +11,7 @@ IMPORTANT: MIRAGE v0.1 does NOT:
 - Use heuristic thresholds or ML
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "MIRAGE Research Project"
 
 from .collectors import (
