@@ -47,7 +47,7 @@ class Snapshot:
         self._data["metadata"] = {
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "collector_name": collector_name or "mirage",
-            "collector_version": collector_version or "0.1.0",
+            "collector_version": collector_version or "0.1.1",
             "notes": notes,
         }
     
