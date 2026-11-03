@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mirage-profiler"
-version = "0.1.0"
+version = "0.2.0"
 description = "MIRAGE - Passive Linux Environment Profiler for cybersecurity research"
 readme = "README.md"
 license = {text = "MIT"}
@@ -36,8 +36,8 @@ dev = [
 mirage = "mirage.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/mirage-profiler/mirage"
-Repository = "https://github.com/mirage-profiler/mirage.git"
+Homepage = "https://github.com/ahmadanshab7-maker/MIRAGE"
+Repository = "https://github.com/ahmadanshab7-maker/MIRAGE.git"
 
 [tool.setuptools.packages.find]
 where = ["."]

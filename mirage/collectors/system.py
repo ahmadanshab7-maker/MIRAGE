@@ -48,40 +48,38 @@ def _parse_cpuinfo() -> dict[str, Any]:
     if not content:
         return result
     
-    processors = re.split(r"\n(?=\w+:)", content)
     core_count = 0
     mhz_values: list[float] = []
-    
-    for section in processors:
-        if "processor" in section.lower():
+
+    for line in content.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+
+        if key == "processor":
+            # One "processor : N" line per logical CPU
             core_count += 1
-        
-        for line in section.splitlines():
-            if ":" in line:
-                key, value = line.split(":", 1)
-                key = key.strip().lower()
-                value = value.strip()
-                
-                if key == "model name":
-                    result["model_name"] = value
-                elif key == "vendor id":
-                    result["vendor_id"] = value
-                elif key == "cache size":
-                    match = re.search(r"(\d+)", value)
-                    if match:
-                        result["cache_size_kb"] = int(match.group(1))
-                # flags/features intentionally skipped - not needed for environmental characterization
-                elif key in ("cpu mhz", "cpu MHz"):
-                    try:
-                        mhz_values.append(float(value))
-                    except ValueError:
-                        pass
-    
+        elif key == "model name":
+            result["model_name"] = value
+        elif key in ("vendor_id", "vendor id"):
+            result["vendor_id"] = value
+        elif key == "cache size":
+            match = re.search(r"(\d+)", value)
+            if match:
+                result["cache_size_kb"] = int(match.group(1))
+        elif key == "cpu mhz":
+            try:
+                mhz_values.append(float(value))
+            except ValueError:
+                pass
+        # flags/features intentionally skipped - fingerprinting concern
+
     result["cpu_cores"] = core_count
-    # Count siblings from physical cores perspective
-    result["siblings"] = core_count  # Simplified; accurate sibling count needs more parsing
-    # No flags collected
-    
+    # Logical CPU count; physical sibling topology needs more parsing
+    result["siblings"] = core_count
+
     if mhz_values:
         result["cpu_mhz_min"] = min(mhz_values)
         result["cpu_mhz_max"] = max(mhz_values)
