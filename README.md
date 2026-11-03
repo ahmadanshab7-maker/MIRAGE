@@ -1,10 +1,10 @@
-# MIRAGE v0.1 - Passive Linux Environment Profiler
+# MIRAGE v0.2.0 - Passive Linux Environment Profiler
 
 **MIRAGE** is a measurement instrument for cybersecurity research studying environmental realism and deception. It collects read-only environmental measurements from Linux systems and saves them as structured JSON.
 
 ## ⚠️ Important Disclaimers
 
-**MIRAGE v0.1 is NOT:**
+**MIRAGE v0.2.0 is NOT:**
 - A honeypot detector
 - A sandbox detection tool
 - A malware anti-analysis tool
@@ -13,15 +13,15 @@
 **Key principles:**
 1. **Virtualization is NOT evidence of deception.** Many legitimate systems run in VMs or containers.
 2. **Sparse activity is NOT evidence of deception.** Newly provisioned systems naturally have minimal history.
-3. **No authenticity score exists in v0.1.** This tool only measures; it does not interpret or classify.
+3. **No authenticity score exists in v0.2.0.** This tool only measures; it does not interpret or classify.
 4. **The collected dataset will be used for controlled experiments.** Future research will analyze measurement patterns under known conditions.
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/mirage-profiler/mirage.git
-cd mirage
+git clone https://github.com/ahmadanshab7-maker/MIRAGE.git
+cd MIRAGE
 
 # Install in development mode
 pip install -e .
@@ -57,6 +57,17 @@ python -m mirage.cli --no-users --no-filesystem --output minimal.json
 python -m mirage.cli --notes "Fresh Debian 12 VM" --output vm1.json
 ```
 
+### Validate and compare snapshots
+
+```bash
+python -m mirage --validate snapshot.json          # check structure
+python -m mirage --diff before.json after.json     # list added/removed/changed measurements
+python -m mirage --compact --strict -o snap.json   # compact JSON; exit 2 on collector errors
+```
+
+`--diff` is descriptive only: it reports what changed (with numeric deltas) and
+does not interpret or score differences.
+
 ### View help
 ```bash
 python -m mirage.cli --help
@@ -64,7 +75,7 @@ python -m mirage.cli --help
 
 ## Collectors
 
-MIRAGE v0.1 includes six passive collectors:
+MIRAGE v0.2.0 includes six passive collectors:
 
 ### 1. System Collector (`system`)
 Collects read-only system information from `/proc`, `/sys`, and standard Python APIs:
@@ -72,7 +83,7 @@ Collects read-only system information from `/proc`, `/sys`, and standard Python 
 - Kernel information (sysname, release, version)
 - Hostname
 - Architecture (bits, machine type, processor)
-- CPU characteristics (model, cores, flags, frequency range)
+- CPU characteristics (model, logical CPU count, vendor, cache, frequency range; flags are intentionally not collected)
 - RAM characteristics (total, free, available, buffers, cached)
 - Storage/filesystem statistics (mount points, capacity, usage)
 - Uptime (seconds since boot)
@@ -144,8 +155,7 @@ The output is a JSON document with the following structure:
   "metadata": {
     "collected_at": "2024-01-15T10:30:00+00:00",
     "collector_name": "mirage",
-    "collector_version": "0.1.0",
-    "hostname": "example-host",
+    "collector_version": "0.2.0",
     "notes": null
   },
   "collectors": {
@@ -162,7 +172,7 @@ The output is a JSON document with the following structure:
 
 ## Privacy and Safety
 
-MIRAGE v0.1 is designed with privacy in mind. It explicitly does NOT collect:
+MIRAGE v0.2.0 is designed with privacy in mind. It explicitly does NOT collect:
 - File contents
 - Passwords or credentials
 - Tokens or private keys
@@ -176,7 +186,7 @@ All collectors use read-only interfaces (`/proc`, `/sys`, standard APIs) and tol
 
 ## Portability
 
-MIRAGE v0.1 targets Linux systems and handles:
+MIRAGE v0.2.0 targets Linux systems and handles:
 - Different distributions (Debian, Ubuntu, RHEL, Fedora, Arch, etc.)
 - Containers (Docker, LXC, Podman)
 - Virtual machines (KVM, VMware, VirtualBox, Hyper-V, cloud instances)

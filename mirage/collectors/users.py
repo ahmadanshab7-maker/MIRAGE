@@ -193,7 +193,7 @@ def collect() -> dict[str, Any]:
             "total_count": len(accounts),
             "uid_min": uid_min,
             "uid_max": uid_max,
-            "shells": list(set(acc["shell"] for acc in accounts if acc["shell"])),
+            "shells": sorted(set(acc["shell"] for acc in accounts if acc["shell"])),
             "unique_gids": len(set(acc["gid"] for acc in accounts)),
             "uid_policy": {
                 "source": uid_range["source"],

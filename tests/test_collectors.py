@@ -6,11 +6,26 @@ as those depend on the system being profiled.
 """
 
 import json
+import re
 import pytest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from mirage.models.snapshot import Snapshot, SCHEMA_VERSION
 from mirage.collectors import system, users, filesystem, software, runtime, network
+
+
+@pytest.fixture(autouse=True)
+def isolate_user_database(monkeypatch):
+    """Keep collector tests bounded and independent of the host's home tree."""
+    account = SimpleNamespace(
+        pw_uid=1001,
+        pw_gid=100,
+        pw_dir="/nonexistent/mirage-test-home",
+        pw_shell="/bin/sh",
+        pw_gecos="",
+    )
+    monkeypatch.setattr(users.pwd, "getpwall", lambda: [account])
 
 
 class TestSnapshot:
@@ -454,34 +469,43 @@ class TestIntegration:
 class TestPrivacyInvariants:
     """Tests for privacy-related invariants that must always hold."""
     
-    def test_hostname_not_in_serialized_output(self):
-        """Test that known hostname cannot appear anywhere in serialized output.
-        
-        This is a semantic test - it verifies that even if fields are renamed,
-        the actual hostname value does not leak into the output.
+    def test_hostname_not_in_serialized_output(self, monkeypatch):
+        """A known hostname must not appear anywhere in serialized output.
+
+        The hostname is replaced with a unique sentinel so the check cannot
+        collide with legitimate values (a real hostname like "vm" would also
+        match the virtualization type). Fields could be renamed in future;
+        this verifies the *value* never leaks.
         """
         import platform
-        actual_hostname = platform.node()
-        
+        import socket
+        from types import SimpleNamespace
+
+        sentinel = "mirage-sentinel-host-7f3a91"
+        fake_uname = SimpleNamespace(
+            sysname=platform.system(),
+            nodename=sentinel,
+            release=platform.release(),
+            version=platform.version(),
+            machine=platform.machine(),
+        )
+
+        monkeypatch.setattr(platform, "node", lambda: sentinel)
+        monkeypatch.setattr(socket, "gethostname", lambda: sentinel)
+        # system.collect reads os.uname on Unix. Supply it on Windows too so
+        # the sentinel exercises the same privacy path on every platform.
+        monkeypatch.setattr(system.os, "uname", lambda: fake_uname, raising=False)
+
         snapshot = Snapshot()
         snapshot.set_metadata(collector_name="privacy_test")
-        
-        # Add all collector results
-        snapshot.add_collector_result("system", system.collect())
-        snapshot.add_collector_result("users", users.collect())
-        snapshot.add_collector_result("filesystem", filesystem.collect())
-        snapshot.add_collector_result("software", software.collect())
-        snapshot.add_collector_result("runtime", runtime.collect())
-        snapshot.add_collector_result("network", network.collect())
-        
-        # Serialize to JSON
-        json_str = snapshot.to_json()
-        
-        # The actual hostname should NOT appear anywhere in the output
-        # This catches leaks through node, nodename, or any other field
-        assert actual_hostname not in json_str, \
-            f"Hostname '{actual_hostname}' found in serialized output!"
-    
+        for name, module in [
+            ("system", system), ("users", users), ("filesystem", filesystem),
+            ("software", software), ("runtime", runtime), ("network", network),
+        ]:
+            snapshot.add_collector_result(name, module.collect())
+
+        assert sentinel not in snapshot.to_json(), "Hostname leaked into output!"
+
     def test_hostname_not_in_system_os_or_kernel(self):
         """Test that system.os.node and system.kernel.nodename are not present."""
         result = system.collect()
@@ -648,3 +672,175 @@ class TestTruncationSemantics:
         # If truncated, should have truncation_reasons
         if not agg["collection_complete"]:
             assert "truncation_reasons" in agg
+
+
+class TestCpuinfoParsing:
+    """Tests for /proc/cpuinfo parsing."""
+
+    SAMPLE = (
+        "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\n"
+        "model name\t: Intel(R) Xeon(R) Processor @ 2.20GHz\n"
+        "cpu MHz\t\t: 2200.000\ncache size\t: 56320 KB\nflags\t\t: fpu vme\n\n"
+        "processor\t: 1\nvendor_id\t: GenuineIntel\n"
+        "model name\t: Intel(R) Xeon(R) Processor @ 2.20GHz\n"
+        "cpu MHz\t\t: 2400.000\ncache size\t: 56320 KB\nflags\t\t: fpu vme\n"
+    )
+
+    def test_counts_each_logical_cpu_once(self, monkeypatch):
+        monkeypatch.setattr(system, "_read_proc_file", lambda path: self.SAMPLE)
+        result = system._parse_cpuinfo()
+        assert result["cpu_cores"] == 2
+        assert result["vendor_id"] == "GenuineIntel"
+        assert result["cpu_mhz_min"] == 2200.0
+        assert result["cpu_mhz_max"] == 2400.0
+        assert result["cache_size_kb"] == 56320
+
+    def test_missing_cpu_fields_are_omitted(self, monkeypatch):
+        monkeypatch.setattr(
+            system, "_read_proc_file", lambda path: "processor : 0\nmodel name : Test CPU\n"
+        )
+        result = system._parse_cpuinfo()
+        assert result["cpu_cores"] == 1
+        assert result["model_name"] == "Test CPU"
+        assert result["vendor_id"] is None
+        assert result["cache_size_kb"] is None
+        assert result["cpu_mhz_min"] is None
+        assert result["cpu_mhz_max"] is None
+
+    def test_flags_not_collected(self, monkeypatch):
+        monkeypatch.setattr(system, "_read_proc_file", lambda path: self.SAMPLE)
+        assert "flags" not in system._parse_cpuinfo()
+
+    def test_missing_cpuinfo(self, monkeypatch):
+        monkeypatch.setattr(system, "_read_proc_file", lambda path: None)
+        assert system._parse_cpuinfo()["cpu_cores"] == 0
+
+
+class TestDeterminism:
+    """Repeated collection must not reorder list-valued measurements."""
+
+    def test_shells_sorted_and_collection_stable(self, monkeypatch):
+        from types import SimpleNamespace
+
+        accounts = [
+            SimpleNamespace(
+                pw_uid=1002, pw_gid=100, pw_dir="/nonexistent/mirage-test-2",
+                pw_shell="/usr/bin/zsh", pw_gecos="",
+            ),
+            SimpleNamespace(
+                pw_uid=1001, pw_gid=100, pw_dir="/nonexistent/mirage-test-1",
+                pw_shell="/bin/sh", pw_gecos="",
+            ),
+        ]
+        monkeypatch.setattr(users.pwd, "getpwall", lambda: accounts)
+
+        first = users.collect()
+        second = users.collect()
+        assert first["account_statistics"]["shells"] == ["/bin/sh", "/usr/bin/zsh"]
+        assert first == second
+
+
+class TestCompare:
+    """Tests for descriptive snapshot diffing."""
+
+    def test_added_removed_changed(self):
+        from mirage.compare import diff_snapshots
+
+        a = {"metadata": {"collected_at": "x"}, "c": {"n": 1, "gone": 5, "same": 2}}
+        b = {"metadata": {"collected_at": "y"}, "c": {"n": 4, "new": 9, "same": 2}}
+        result = diff_snapshots(a, b)
+        assert result["added"] == {"c.new": 9}
+        assert result["removed"] == {"c.gone": 5}
+        assert result["changed"] == {"c.n": {"from": 1, "to": 4, "delta": 3}}
+        assert result["unchanged_count"] == 1
+
+    def test_collected_at_ignored(self):
+        from mirage.compare import diff_snapshots
+
+        r = diff_snapshots({"metadata": {"collected_at": "1"}}, {"metadata": {"collected_at": "2"}})
+        assert not r["changed"]
+
+    def test_empty_containers_are_reported(self):
+        from mirage.compare import diff_snapshots
+
+        result = diff_snapshots({"c": {}}, {"c": {"empty_list": []}})
+        assert result["added"] == {"c.empty_list": []}
+        assert result["removed"] == {"c": {}}
+
+    def test_numeric_delta_handles_floats_and_booleans(self):
+        from mirage.compare import diff_snapshots
+
+        result = diff_snapshots({"n": 1.25, "flag": False}, {"n": 2.0, "flag": True})
+        assert result["changed"]["n"]["delta"] == 0.75
+        assert "delta" not in result["changed"]["flag"]
+
+
+class TestCli:
+    """Tests for CLI behavior."""
+
+    def test_unknown_collector_fails(self):
+        from mirage.cli import main
+        assert main(["-c", "nope", "--quiet"]) == 1
+
+    def test_no_flags_apply_with_explicit_collectors(self, capsys):
+        from mirage.cli import main
+        assert main(["-c", "system,users", "--no-users", "--quiet", "--compact"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert list(data["collectors"]) == ["system"]
+
+    def test_duplicate_collectors_run_once(self, monkeypatch, capsys):
+        from mirage import cli
+
+        calls = []
+        monkeypatch.setitem(cli.ALL_COLLECTORS, "system", lambda: calls.append(1) or {"ok": True})
+        assert cli.main(["-c", "system,system", "--quiet"]) == 0
+        assert len(calls) == 1
+        assert list(json.loads(capsys.readouterr().out)["collectors"]) == ["system"]
+
+    def test_no_filesystem_exclusion_with_explicit_collectors(self, monkeypatch, capsys):
+        from mirage import cli
+
+        monkeypatch.setitem(cli.ALL_COLLECTORS, "system", lambda: {"ok": True})
+        monkeypatch.setitem(cli.ALL_COLLECTORS, "filesystem", lambda: {"ok": True})
+        assert cli.main(["-c", "system,filesystem", "--no-filesystem", "--quiet"]) == 0
+        assert list(json.loads(capsys.readouterr().out)["collectors"]) == ["system"]
+
+    def test_compact_output(self, monkeypatch, capsys):
+        from mirage import cli
+
+        monkeypatch.setitem(cli.ALL_COLLECTORS, "system", lambda: {"value": 1})
+        assert cli.main(["-c", "system", "--quiet", "--compact"]) == 0
+        output = capsys.readouterr().out
+        assert "\n" not in output.strip()
+        assert json.loads(output)["collectors"]["system"]["value"] == 1
+
+    def test_validate_roundtrip(self, tmp_path):
+        from mirage.cli import main
+        out = tmp_path / "s.json"
+        assert main(["-c", "system", "--quiet", "-o", str(out)]) == 0
+        assert main(["--validate", str(out)]) == 0
+        assert main(["--diff", str(out), str(out)]) == 0
+
+    def test_validate_rejects_bad_file(self, tmp_path):
+        from mirage.cli import main
+        bad = tmp_path / "bad.json"
+        bad.write_text("{}")
+        assert main(["--validate", str(bad)]) == 1
+
+    def test_validate_rejects_non_object_json(self, tmp_path):
+        from mirage.cli import main
+
+        bad = tmp_path / "array.json"
+        bad.write_text("[]")
+        assert main(["--validate", str(bad)]) == 1
+        assert main(["--diff", str(bad), str(bad)]) == 1
+
+    def test_strict_exit_code_on_collector_failure(self, monkeypatch):
+        from mirage import cli
+
+        def boom():
+            raise RuntimeError("boom")
+
+        monkeypatch.setitem(cli.ALL_COLLECTORS, "system", boom)
+        assert cli.main(["-c", "system", "--quiet", "--strict"]) == 2
+        assert cli.main(["-c", "system", "--quiet"]) == 0

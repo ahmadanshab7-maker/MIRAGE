@@ -31,7 +31,7 @@ class Snapshot:
     def set_metadata(
         self,
         collector_name: Optional[str] = None,
-        collector_version: Optional[str] = None,
+            collector_version: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> None:
         """Set collection metadata.
@@ -47,7 +47,7 @@ class Snapshot:
         self._data["metadata"] = {
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "collector_name": collector_name or "mirage",
-            "collector_version": collector_version or "0.1.1",
+            "collector_version": collector_version or "0.2.0",
             "notes": notes,
         }
     
@@ -152,6 +152,9 @@ class Snapshot:
             List of validation error messages (empty if valid)
         """
         errors: list[str] = []
+
+        if not isinstance(self._data, dict):
+            return ["Snapshot root must be a dictionary"]
         
         # Check required top-level keys
         required_keys = ["schema_version", "metadata", "collectors"]
